@@ -3,21 +3,25 @@ from __future__ import annotations
 import os
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import Body, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 
+from .guardrails import evaluate_guardrails, load_guardrails
 from .keys import create_and_store_key, hash_key
-from .storage import build_key_store, build_usage_store
+from .storage import build_guardrail_store, build_key_store, build_usage_store
 
 
 load_dotenv()
 
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com")
 UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "600"))
+GUARDRAILS_ENABLED = os.getenv("GATEWAY_GUARDRAILS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+GUARDRAILS_DIR = Path(os.getenv("GATEWAY_GUARDRAILS_DIR", ".gateway"))
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -47,6 +51,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.key_store.initialize()
     app.state.usage_store = build_usage_store()
     app.state.usage_store.initialize()
+    app.state.guardrail_store = build_guardrail_store()
+    app.state.guardrail_store.initialize()
     try:
         yield
     finally:
@@ -120,12 +126,47 @@ async def create_key(
     return JSONResponse({"key": key})
 
 
+@app.post("/admin/guardrails")
+async def upsert_guardrail(
+    x_admin_token: str | None = Header(default=None),
+    body: dict = Body(...),
+) -> JSONResponse:
+    admin_token = os.getenv("GATEWAY_ADMIN_TOKEN")
+    if not admin_token:
+        raise HTTPException(status_code=404, detail="Admin guardrail management is disabled")
+    if x_admin_token != admin_token:
+        raise HTTPException(status_code=401, detail="Invalid admin token")
+
+    name = body.get("name")
+    guardrail_type = body.get("type")
+    config = body.get("config", {})
+    enabled = body.get("enabled", True)
+    if not isinstance(name, str) or not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    if not isinstance(guardrail_type, str) or not guardrail_type:
+        raise HTTPException(status_code=400, detail="type is required")
+    if not isinstance(config, dict):
+        raise HTTPException(status_code=400, detail="config must be an object")
+
+    app.state.guardrail_store.upsert_guardrail(
+        name=name,
+        guardrail_type=guardrail_type,
+        config=config,
+        enabled=bool(enabled),
+    )
+    return JSONResponse({"status": "ok"})
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy_openai(path: str, request: Request) -> Response:
     key_hash = require_gateway_key(request)
 
     url = f"{OPENAI_BASE_URL.rstrip('/')}/v1/{path}"
     body = await request.body()
+    guardrail_response = enforce_guardrails(request, key_hash, body)
+    if guardrail_response:
+        return guardrail_response
+
     client: httpx.AsyncClient = request.app.state.http
 
     if wants_streaming_response(request, body):
@@ -154,6 +195,32 @@ async def proxy_openai(path: str, request: Request) -> Response:
         status_code=upstream.status_code,
         headers=response_headers(upstream.headers),
         media_type=upstream.headers.get("content-type"),
+    )
+
+
+def enforce_guardrails(request: Request, key_hash: str, body: bytes) -> JSONResponse | None:
+    if not GUARDRAILS_ENABLED:
+        return None
+
+    decision = evaluate_guardrails(
+        guardrails=load_guardrails(request.app.state.guardrail_store, GUARDRAILS_DIR),
+        key_hash=key_hash,
+        usage_store=request.app.state.usage_store,
+        request_payload=parse_json_body(body),
+    )
+    if decision.allowed:
+        return None
+
+    return JSONResponse(
+        status_code=decision.status_code,
+        content={
+            "error": {
+                "code": decision.code,
+                "message": decision.message,
+                "guardrail": decision.guardrail,
+                "details": decision.details or {},
+            }
+        },
     )
 
 
@@ -200,6 +267,14 @@ def extract_usage(content: bytes) -> tuple[dict[str, int] | None, str | None]:
     numeric_usage = {key: value for key, value in usage.items() if isinstance(value, int)}
     model = payload.get("model") if isinstance(payload.get("model"), str) else None
     return numeric_usage, model
+
+
+def parse_json_body(body: bytes) -> dict | None:
+    try:
+        payload = json.loads(body or b"{}")
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def wants_streaming_response(request: Request, body: bytes) -> bool:

@@ -1,0 +1,10 @@
+{
+  "name": "monthly-token-cap",
+  "type": "token_usage_limit",
+  "enabled": false,
+  "config": {
+    "max_total_tokens": 1000000,
+    "include_request_estimate": true,
+    "message": "This gateway key has reached its token usage limit."
+  }
+}
