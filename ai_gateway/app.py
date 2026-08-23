@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -10,7 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 
 from .keys import create_and_store_key, hash_key
-from .storage import build_key_store
+from .storage import build_key_store, build_usage_store
 
 
 load_dotenv()
@@ -44,6 +45,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.http = httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT)
     app.state.key_store = build_key_store()
     app.state.key_store.initialize()
+    app.state.usage_store = build_usage_store()
+    app.state.usage_store.initialize()
     try:
         yield
     finally:
@@ -53,7 +56,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="AI Gateway", lifespan=lifespan)
 
 
-def require_gateway_key(request: Request) -> None:
+def require_gateway_key(request: Request) -> str:
     authorization = request.headers.get("authorization", "")
     scheme, _, token = authorization.partition(" ")
     if scheme.lower() != "bearer" or not token:
@@ -63,6 +66,7 @@ def require_gateway_key(request: Request) -> None:
     env_hashes = {item.strip() for item in os.getenv("GATEWAY_KEY_HASHES", "").split(",") if item.strip()}
     if key_hash not in env_hashes and not request.app.state.key_store.has_key_hash(key_hash):
         raise HTTPException(status_code=401, detail="Invalid gateway bearer token")
+    return key_hash
 
 
 def upstream_headers(request: Request) -> dict[str, str]:
@@ -118,7 +122,7 @@ async def create_key(
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy_openai(path: str, request: Request) -> Response:
-    require_gateway_key(request)
+    key_hash = require_gateway_key(request)
 
     url = f"{OPENAI_BASE_URL.rstrip('/')}/v1/{path}"
     body = await request.body()
@@ -137,12 +141,65 @@ async def proxy_openai(path: str, request: Request) -> Response:
         content=body,
         headers=upstream_headers(request),
     )
+    track_usage(
+        request=request,
+        path=f"/v1/{path}",
+        key_hash=key_hash,
+        response_content=upstream.content,
+        response_status=upstream.status_code,
+        response_headers=upstream.headers,
+    )
     return Response(
         content=upstream.content,
         status_code=upstream.status_code,
         headers=response_headers(upstream.headers),
         media_type=upstream.headers.get("content-type"),
     )
+
+
+def track_usage(
+    *,
+    request: Request,
+    path: str,
+    key_hash: str,
+    response_content: bytes,
+    response_status: int,
+    response_headers: httpx.Headers,
+) -> None:
+    usage, model = extract_usage(response_content)
+    if not usage:
+        return
+
+    request_id = response_headers.get("x-request-id")
+    request.app.state.usage_store.record_usage(
+        key_hash=key_hash,
+        method=request.method,
+        path=path,
+        model=model,
+        status_code=response_status,
+        input_tokens=usage.get("input_tokens") or usage.get("prompt_tokens"),
+        output_tokens=usage.get("output_tokens") or usage.get("completion_tokens"),
+        total_tokens=usage.get("total_tokens"),
+        request_id=request_id,
+    )
+
+
+def extract_usage(content: bytes) -> tuple[dict[str, int] | None, str | None]:
+    try:
+        payload = json.loads(content or b"{}")
+    except json.JSONDecodeError:
+        return None, None
+
+    if not isinstance(payload, dict):
+        return None, None
+
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None, payload.get("model") if isinstance(payload.get("model"), str) else None
+
+    numeric_usage = {key: value for key, value in usage.items() if isinstance(value, int)}
+    model = payload.get("model") if isinstance(payload.get("model"), str) else None
+    return numeric_usage, model
 
 
 def wants_streaming_response(request: Request, body: bytes) -> bool:
@@ -153,8 +210,6 @@ def wants_streaming_response(request: Request, body: bytes) -> bool:
         return False
 
     try:
-        import json
-
         payload = json.loads(body or b"{}")
     except json.JSONDecodeError:
         return False

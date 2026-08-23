@@ -38,6 +38,30 @@ export GATEWAY_REDIS_CACHE_TTL_SECONDS=300
 
 The gateway creates the `gateway_keys` table automatically on startup or when creating a key.
 
+## Token usage tracking
+
+Usage tracking is enabled by default. The gateway records token counts returned by OpenAI in the response `usage` field.
+
+```bash
+export GATEWAY_USAGE_TRACKING_ENABLED=true
+```
+
+By default, usage records use the same backend as key storage. To configure it separately:
+
+```bash
+export GATEWAY_USAGE_STORE=sqlite
+export GATEWAY_USAGE_SQLITE_PATH=gateway_keys.db
+```
+
+or:
+
+```bash
+export GATEWAY_USAGE_STORE=postgres
+export GATEWAY_USAGE_POSTGRES_DSN=postgresql://user:password@localhost:5432/ai_gateway
+```
+
+Set `GATEWAY_USAGE_TRACKING_ENABLED=false` to disable usage tracking. The gateway creates a `token_usage` table with the gateway key hash, method, path, model, status code, input tokens, output tokens, total tokens, upstream request id, and timestamp.
+
 ## Create a gateway key
 
 ```bash
