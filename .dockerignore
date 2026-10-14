@@ -1,0 +1,10 @@
+.git
+.venv
+.env
+.env.*
+__pycache__
+*.pyc
+*.db
+*.db-*
+tests
+.gateway

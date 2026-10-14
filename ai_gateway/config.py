@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
@@ -55,6 +56,7 @@ class RateLimiting(ConfigModel):
 
 
 class GatewayConfig(ConfigModel):
+    key_api_enabled: StrictBool = False
     load_balancing_enabled: StrictBool = True
     session_aware: StrictBool = True
     default_route: str | None = None
@@ -63,7 +65,7 @@ class GatewayConfig(ConfigModel):
 
 
 class Gateway(ConfigModel):
-    id: str = Field(min_length=1, pattern=r"^[a-zA-Z0-9_-]+$")
+    id: str = Field(default_factory=lambda: "gw-" + uuid4().hex, min_length=1, pattern=r"^[a-zA-Z0-9_-]+$")
     name: str | None = None
     routes: list[Route] = Field(default_factory=list)
     guardrails: list[Guardrail] = Field(default_factory=list)

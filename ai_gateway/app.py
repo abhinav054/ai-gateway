@@ -13,6 +13,7 @@ import httpx
 from fastapi import Body, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
+from pydantic import ValidationError
 
 from .guardrails import evaluate_guardrails, load_guardrails
 from .config import Gateway, Route
@@ -207,6 +208,49 @@ async def get_gateway(gateway_id: str, x_admin_token: str | None = Header(defaul
     return JSONResponse(sandbox.public_dict())
 
 
+@app.put("/admin/gateways/{gateway_id}")
+async def update_gateway(gateway_id: str, body: dict = Body(...), x_admin_token: str | None = Header(default=None)) -> JSONResponse:
+    require_admin_token(x_admin_token)
+    previous = app.state.key_store.get_gateway(gateway_id)
+    if previous is None:
+        raise HTTPException(status_code=404, detail="Unknown gateway")
+    if body.get("id", gateway_id) != gateway_id:
+        raise HTTPException(status_code=400, detail="Gateway ID cannot be changed")
+    payload = dict(body, id=gateway_id)
+    routes = payload.get("routes")
+    if not isinstance(routes, list) or not routes:
+        raise HTTPException(status_code=400, detail="At least one route is required")
+    stored_routes = {route.name: route for route in previous.routes}
+    for route in routes:
+        if not isinstance(route, dict):
+            raise HTTPException(status_code=400, detail="Invalid route")
+        if not isinstance(route.get("name"), str) or not isinstance(route.get("base_url"), str):
+            raise HTTPException(status_code=400, detail="Invalid route")
+        key = route.get("api_key")
+        if key is None or isinstance(key, str) and not key.strip():
+            stored = stored_routes.get(route.get("name"))
+            if stored is None or route.get("provider") != stored.provider or route.get("base_url", "").rstrip("/") != stored.base_url:
+                raise HTTPException(status_code=400, detail="An API key is required for new or changed routes")
+            route["api_key"] = stored.api_key
+    try:
+        updated = Gateway.model_validate(payload)
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="Invalid gateway configuration") from None
+    app.state.key_store.upsert_gateway(updated)
+    return JSONResponse(updated.public_dict())
+
+
+@app.delete("/admin/gateways/{gateway_id}")
+async def disable_gateway(gateway_id: str, x_admin_token: str | None = Header(default=None)) -> Response:
+    require_admin_token(x_admin_token)
+    previous = app.state.key_store.get_gateway(gateway_id)
+    if previous is None:
+        raise HTTPException(status_code=404, detail="Unknown gateway")
+    disabled = previous.model_copy(update={"routes": [], "config": previous.config.model_copy(update={"default_route": None})})
+    app.state.key_store.upsert_gateway(disabled)
+    return Response(status_code=204)
+
+
 def session_parameter(request: Request) -> str | None:
     session = request.headers.get("gateway-session")
     if session is not None and not session.strip():
@@ -276,6 +320,44 @@ async def list_keys(gateway_id: str, x_admin_token: str | None = Header(default=
     if not secrets.compare_digest(x_admin_token or "", admin_token):
         raise HTTPException(status_code=401, detail="Invalid admin token")
     return JSONResponse(app.state.key_store.list_keys(gateway_id), headers={"Cache-Control": "no-store"})
+
+
+def require_key_api(gateway_id: str, token: str | None) -> Gateway:
+    require_admin_token(token)
+    sandbox = app.state.key_store.get_gateway(gateway_id)
+    if sandbox is None:
+        raise HTTPException(status_code=404, detail="Unknown gateway")
+    if not sandbox.config.key_api_enabled:
+        raise HTTPException(status_code=403, detail="Key API is disabled for this gateway")
+    return sandbox
+
+
+@app.delete("/admin/keys/{key_id}", status_code=204)
+async def revoke_admin_key(key_id: str, gateway_id: str, x_admin_token: str | None = Header(default=None)) -> Response:
+    require_admin_token(x_admin_token)
+    if not app.state.key_store.revoke_key(gateway_id, key_id):
+        raise HTTPException(status_code=404, detail="Key not found in this gateway")
+    return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/admin/gateways/{gateway_id}/keys", status_code=201)
+async def issue_gateway_key(gateway_id: str, body: dict = Body(...), x_admin_token: str | None = Header(default=None)) -> JSONResponse:
+    sandbox = require_key_api(gateway_id, x_admin_token)
+    if not sandbox.routes:
+        raise HTTPException(status_code=409, detail="Gateway has no active routes")
+    name = body.get("name")
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100:
+        raise HTTPException(status_code=400, detail="Client name is required (maximum 100 characters)")
+    key = create_and_store_key(name=name.strip(), store=app.state.key_store, gateway_id=gateway_id)
+    return JSONResponse({"key": key, "id": hash_key(key), "gateway_id": gateway_id}, status_code=201, headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/admin/gateways/{gateway_id}/keys/{key_id}", status_code=204)
+async def revoke_gateway_key(gateway_id: str, key_id: str, x_admin_token: str | None = Header(default=None)) -> Response:
+    require_key_api(gateway_id, x_admin_token)
+    if not app.state.key_store.revoke_key(gateway_id, key_id):
+        raise HTTPException(status_code=404, detail="Key not found in this gateway")
+    return Response(status_code=204, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/admin/routes")

@@ -36,6 +36,9 @@ class RoutingConfig:
 
 
 class KeyStore(Protocol):
+    def revoke_key(self, gateway_id: str, key_hash: str) -> bool:
+        ...
+
     def list_keys(self, gateway_id: str) -> list[dict]:
         ...
 
@@ -223,6 +226,11 @@ CREATE TABLE IF NOT EXISTS guardrails (
 
 @dataclass
 class SQLiteKeyStore:
+    def revoke_key(self, gateway_id: str, key_hash: str) -> bool:
+        with self.connect() as conn:
+            result = conn.execute("DELETE FROM gateway_keys WHERE gateway_id = ? AND key_hash = ?", (gateway_id, key_hash))
+        return result.rowcount > 0
+
     def list_keys(self, gateway_id: str) -> list[dict]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -452,6 +460,13 @@ class SQLiteGuardrailStore:
 
 @dataclass
 class PostgresKeyStore:
+    def revoke_key(self, gateway_id: str, key_hash: str) -> bool:
+        with psycopg.connect(self.dsn) as conn:
+            result = conn.execute("DELETE FROM gateway_keys WHERE gateway_id = %s AND key_hash = %s", (gateway_id, key_hash))
+        if result.rowcount and self._redis:
+            self._redis.delete(self.cache_key(key_hash))
+        return result.rowcount > 0
+
     def list_keys(self, gateway_id: str) -> list[dict]:
         with psycopg.connect(self.dsn) as conn:
             rows = conn.execute(
