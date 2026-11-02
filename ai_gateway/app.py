@@ -4,6 +4,8 @@ import os
 import json
 import re
 import secrets
+import logging
+import time
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -22,6 +24,7 @@ from .storage import GatewayKey, RoutingConfig, build_guardrail_store, build_key
 
 
 load_dotenv()
+logger = logging.getLogger("uvicorn.error")
 
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com")
 UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "600"))
@@ -442,7 +445,13 @@ async def proxy_openai(path: str, request: Request) -> Response:
     session = session_parameter(request)
     upstream = resolve_upstream(request, gateway_key, session)
     base_url = upstream_base_url(upstream)
-    url = f"{base_url}/v1/{path}"
+    url = upstream_url(base_url, path)
+    if request_payload and isinstance(request_payload.get("model"), str):
+        model = mantle_model_id(base_url, request_payload["model"])
+        request.state.upstream_model = model
+        if model != request_payload["model"]:
+            request_payload["model"] = model
+            body = json.dumps(request_payload).encode()
     rate_limit_key = model_rate_limit_key(request_payload, base_url, upstream_api_key(upstream))
     if request.state.gateway is not None:
         rate_limit_key = f"gateway:{request.state.gateway.id}:{rate_limit_key}"
@@ -456,32 +465,66 @@ async def proxy_openai(path: str, request: Request) -> Response:
 
     client: httpx.AsyncClient = request.app.state.http
 
-    if wants_streaming_response(request, body):
+    streaming = wants_streaming_response(request, body)
+    started = time.monotonic()
+    if streaming and path == "chat/completions" and request_payload is not None:
+        options = request_payload.get("stream_options")
+        if options is None or isinstance(options, dict):
+            request_payload["stream_options"] = {**(options or {}), "include_usage": True}
+            body = json.dumps(request_payload).encode()
+    try:
+        outgoing = client.build_request(
+            request.method, url, params=request.query_params.multi_items(),
+            content=body, headers=upstream_headers(request, upstream),
+        )
+        response = await client.send(outgoing, stream=streaming)
+    except httpx.RequestError as exc:
+        log_upstream(request, upstream, url, started, None, {}, streaming, error=type(exc).__name__)
+        return JSONResponse(status_code=502, content={"error": {"message": "Upstream connection failed", "type": "upstream_connection_error"}})
+
+    if streaming:
+        remember_upstream_rate_limit(request, rate_limit_key, response.status_code, response.headers)
+        # Open upstream before sending downstream headers, so errors retain their
+        # real HTTP status rather than becoming successful SSE responses.
+        if response.status_code >= 400:
+            try:
+                content = await response.aread()
+            finally:
+                await response.aclose()
+                log_upstream(request, upstream, url, started, response.status_code, {}, True,
+                             response_headers=response.headers)
+            return Response(content=content, status_code=response.status_code,
+                            headers=response_headers(response.headers))
         return StreamingResponse(
-            stream_upstream(client, request, upstream, url, body, rate_limit_key),
-            media_type="text/event-stream",
+            stream_upstream(response, request, upstream, url, started, gateway_key.key_hash),
+            status_code=response.status_code, headers=response_headers(response.headers),
+            media_type=response.headers.get("content-type", "text/event-stream"),
         )
 
-    upstream = await client.request(
-        request.method,
-        url,
-        params=request.query_params.multi_items(),
-        content=body,
-        headers=upstream_headers(request, upstream),
-    )
+    log_upstream(request, upstream, url, started, response.status_code,
+                 extract_usage(response.content)[0] or {}, False, response_headers=response.headers)
+    content = response.content
+    if response.is_success and path == "chat/completions":
+        content = normalize_bedrock_tool_names(content, request_payload, base_url)
+    upstream = response
+    forwarded_headers = response_headers(upstream.headers)
+    if content != upstream.content:
+        # JSON re-encoding changes byte length and invalidates entity digests.
+        for header in ("content-length", "etag", "content-md5", "digest"):
+            forwarded_headers.pop(header, None)
     track_usage(
         request=request,
         path=f"/v1/{path}",
         key_hash=gateway_key.key_hash,
-        response_content=upstream.content,
+        response_content=content,
         response_status=upstream.status_code,
         response_headers=upstream.headers,
     )
     remember_upstream_rate_limit(request, rate_limit_key, upstream.status_code, upstream.headers)
     return Response(
-        content=upstream.content,
+        content=content,
         status_code=upstream.status_code,
-        headers=response_headers(upstream.headers),
+        headers=forwarded_headers,
         media_type=upstream.headers.get("content-type"),
     )
 
@@ -646,8 +689,8 @@ def track_usage(
         path=path,
         model=model,
         status_code=response_status,
-        input_tokens=usage.get("input_tokens") or usage.get("prompt_tokens"),
-        output_tokens=usage.get("output_tokens") or usage.get("completion_tokens"),
+        input_tokens=usage.get("input_tokens", usage.get("prompt_tokens")),
+        output_tokens=usage.get("output_tokens", usage.get("completion_tokens")),
         total_tokens=usage.get("total_tokens"),
         request_id=request_id,
     )
@@ -693,24 +736,123 @@ def wants_streaming_response(request: Request, body: bytes) -> bool:
     return payload.get("stream") is True
 
 
-async def stream_upstream(
-    client: httpx.AsyncClient,
-    request: Request,
-    upstream: GatewayKey | RoutingConfig | Route,
-    url: str,
-    body: bytes,
-    rate_limit_key: str,
-) -> AsyncIterator[bytes]:
-    async with client.stream(
-        request.method,
-        url,
-        params=request.query_params.multi_items(),
-        content=body,
-        headers=upstream_headers(request, upstream),
-    ) as upstream_response:
-        remember_upstream_rate_limit(request, rate_limit_key, upstream_response.status_code, upstream_response.headers)
-        if upstream_response.status_code >= 400:
-            yield await upstream_response.aread()
-            return
-        async for chunk in upstream_response.aiter_bytes():
+MANTLE_MODEL_ALIASES = {'openai.gpt-oss-20b-1:0': 'openai.gpt-oss-20b', 'openai.gpt-oss-120b-1:0': 'openai.gpt-oss-120b', 'deepseek.v3-v1:0': 'deepseek.v3.1', 'moonshot.kimi-k2-thinking': 'moonshotai.kimi-k2-thinking', 'qwen.qwen3-235b-a22b-2507-v1:0': 'qwen.qwen3-235b-a22b-2507', 'qwen.qwen3-32b-v1:0': 'qwen.qwen3-32b', 'qwen.qwen3-coder-30b-a3b-v1:0': 'qwen.qwen3-coder-30b-a3b-instruct', 'qwen.qwen3-coder-480b-a35b-v1:0': 'qwen.qwen3-coder-480b-a35b-instruct', 'qwen.qwen3-next-80b-a3b': 'qwen.qwen3-next-80b-a3b-instruct', 'qwen.qwen3-vl-235b-a22b': 'qwen.qwen3-vl-235b-a22b-instruct', 'openai/gpt-oss-20b': 'openai.gpt-oss-20b', 'openai/gpt-oss-120b': 'openai.gpt-oss-120b'}
+
+def mantle_model_id(base_url: str, model: str) -> str:
+    from urllib.parse import urlsplit
+    host = urlsplit(base_url).hostname or ""
+    if re.fullmatch(r"bedrock-mantle\.[a-z0-9-]+\.api\.aws", host):
+        return MANTLE_MODEL_ALIASES.get(model, model)
+    return model
+
+
+
+def normalize_bedrock_tool_names(content: bytes, request_payload: dict | None, base_url: str) -> bytes:
+    from urllib.parse import urlsplit
+    host = urlsplit(base_url).hostname or ""
+    if not re.fullmatch(r"bedrock-(?:mantle\.[a-z0-9-]+\.api\.aws|runtime\.[a-z0-9-]+\.amazonaws\.com)", host):
+        return content
+    if not request_payload or not str(request_payload.get("model", "")).startswith("openai.gpt-oss-"):
+        return content
+    tools = request_payload.get("tools")
+    if not isinstance(tools, list):
+        return content
+    allowed = {
+        tool["function"]["name"] for tool in tools
+        if isinstance(tool, dict) and tool.get("type") == "function"
+        and isinstance(tool.get("function"), dict) and isinstance(tool["function"].get("name"), str)
+    }
+    try:
+        payload = json.loads(content)
+    except (ValueError, UnicodeDecodeError):
+        return content
+    if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list):
+        return content
+    changed = False
+    for choice in payload["choices"]:
+        message = choice.get("message") if isinstance(choice, dict) else None
+        calls = message.get("tool_calls") if isinstance(message, dict) else None
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            function = call.get("function") if isinstance(call, dict) else None
+            name = function.get("name") if isinstance(function, dict) else None
+            if not isinstance(name, str) or name in allowed:
+                continue
+            match = re.fullmatch(r"(.+?)<\|channel\|>(?:commentary|analysis|final)", name)
+            if match and match[1] in allowed:
+                function["name"] = match[1]
+                changed = True
+                logger.info("%s", json.dumps({"event": "llm_tool_name_normalized", "upstream_host": host,
+                                              "original_name": name, "tool": match[1]}))
+    return json.dumps(payload, ensure_ascii=False).encode() if changed else content
+
+
+def upstream_url(base_url: str, path: str) -> str:
+    base = base_url.rstrip("/")
+    prefix = "" if base.endswith("/v1") else "/v1"
+    return f"{base}{prefix}/{path}"
+
+
+def log_upstream(request, route, url, started, status, usage, streaming,
+                 *, response_headers=None, error=None):
+    payload = parse_json_body(getattr(request, "_body", b"")) or {}
+    sandbox = request_gateway(request)
+    # Deliberately exclude bodies, headers, credentials and query strings.
+    from urllib.parse import urlsplit
+    endpoint = urlsplit(url)
+    record = {
+        "event": "llm_upstream_response", "gateway_id": sandbox.id if sandbox else None,
+        "route": getattr(route, "name", None), "provider": route.provider,
+        "upstream_host": endpoint.hostname, "upstream_path": endpoint.path,
+        "model": getattr(request.state, "upstream_model", payload.get("model")),
+        "requested_model": payload.get("model"), "status": status,
+        "duration_ms": round((time.monotonic() - started) * 1000, 2),
+        "stream": streaming, "input_tokens": usage.get("input_tokens", usage.get("prompt_tokens")),
+        "output_tokens": usage.get("output_tokens", usage.get("completion_tokens")),
+        "total_tokens": usage.get("total_tokens"),
+        "request_id": ((response_headers.get("x-request-id") or response_headers.get("x-amzn-requestid"))
+                       if response_headers is not None else None),
+        "error": error,
+    }
+    logger.info("%s", json.dumps(record))
+
+
+async def stream_upstream(response, request, route, url, started, key_hash) -> AsyncIterator[bytes]:
+    usage = {}
+    usage_payload = None
+    pending = b""
+    failure = None
+    try:
+        async for chunk in response.aiter_bytes():
+            # Parse complete SSE lines independently of HTTP chunk boundaries.
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                if line.startswith(b"data:"):
+                    data = line[5:].strip()
+                    if data and data != b"[DONE]":
+                        current, _ = extract_usage(data)
+                        if current is not None:
+                            usage = current
+                            usage_payload = data
+            # Bound memory even if a provider sends a malformed event stream.
+            if len(pending) > 1024 * 1024:
+                pending = b""
             yield chunk
+        if pending.startswith(b"data:"):
+            current, _ = extract_usage(pending[5:].strip())
+            if current is not None:
+                usage = current
+                usage_payload = pending[5:].strip()
+    except BaseException as exc:
+        failure = type(exc).__name__
+        raise
+    finally:
+        await response.aclose()
+        log_upstream(request, route, url, started, response.status_code, usage, True,
+                     response_headers=response.headers, error=failure)
+        if usage_payload is not None:
+            track_usage(request=request, path=request.url.path, key_hash=key_hash,
+                        response_content=usage_payload, response_status=response.status_code,
+                        response_headers=response.headers)

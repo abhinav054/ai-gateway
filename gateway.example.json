@@ -1,0 +1,39 @@
+{
+  "id": "my-app",
+  "name": "My application gateway",
+  "routes": [
+    {
+      "name": "groq-1",
+      "provider": "groq",
+      "api_key": "replace-with-first-upstream-key",
+      "base_url": "https://api.groq.com/openai"
+    },
+    {
+      "name": "groq-2",
+      "provider": "groq",
+      "api_key": "replace-with-second-upstream-key",
+      "base_url": "https://api.groq.com/openai"
+    }
+  ],
+  "guardrails": [
+    {
+      "name": "client-token-budget",
+      "type": "token_usage_limit",
+      "enabled": true,
+      "config": {
+        "max_total_tokens": 1000000,
+        "include_request_estimate": true
+      }
+    }
+  ],
+  "config": {
+    "load_balancing_enabled": true,
+    "session_aware": true,
+    "default_route": "groq-1",
+    "guardrails_enabled": true,
+    "rate_limiting": {
+      "enabled": true,
+      "default_retry_after_seconds": 60
+    }
+  }
+}

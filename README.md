@@ -347,3 +347,33 @@ curl -X POST "http://localhost:8001/admin/routes" \
     "api_key": "gsk-your-real-groq-key"
   }'
 ```
+
+### Upstream response logs
+
+Each forwarded request emits an `llm_upstream_response` JSON record in the
+container logs: gateway ID, route/provider, upstream host/path, model, actual
+upstream HTTP status, total `duration_ms`, streaming flag, input/output/total
+token counts, provider request ID, and transport error class if applicable.
+Request/response bodies, API keys, and authorization headers are excluded.
+Token counts are `null` when the provider does not return usage, including most
+error responses. Streaming Chat Completions request `stream_options.include_usage`
+and collect usage from SSE events while forwarding chunks without buffering the
+whole response. Streaming errors preserve the upstream HTTP status.
+
+Route base URLs may include `/v1` or omit it; the gateway adds it exactly once.
+For Bedrock Mantle, for example, both `https://bedrock-mantle.ap-south-1.api.aws`
+and `https://bedrock-mantle.ap-south-1.api.aws/v1` work. Model IDs still need to
+match the endpoint (Mantle GPT-OSS 20B: `openai.gpt-oss-20b`).
+
+```bash
+kubectl -n cm-client logs deployment/ai-gateway --since=10m | rg llm_upstream_response
+```
+
+Bedrock GPT-OSS non-streaming Chat Completions responses occasionally include
+Harmony channel markers in tool names, such as `read_file<|channel|>commentary`.
+The gateway removes the known `commentary`, `analysis`, or `final` suffix only
+when the remaining name exactly matches a function advertised in that request.
+It leaves tool arguments and IDs intact, logs `llm_tool_name_normalized`, and
+retains usage/status telemetry. Other providers, models, unknown tools and
+unrecognized suffixes are forwarded unchanged. Mate's tool approval checks still
+run against the advertised tool name. Streaming responses are unchanged.
