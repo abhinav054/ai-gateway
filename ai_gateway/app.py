@@ -487,12 +487,13 @@ async def proxy_openai(path: str, request: Request) -> Response:
         # Open upstream before sending downstream headers, so errors retain their
         # real HTTP status rather than becoming successful SSE responses.
         if response.status_code >= 400:
+            content = b""
             try:
                 content = await response.aread()
             finally:
                 await response.aclose()
                 log_upstream(request, upstream, url, started, response.status_code, {}, True,
-                             response_headers=response.headers)
+                             response_headers=response.headers, response_content=content)
             return Response(content=content, status_code=response.status_code,
                             headers=response_headers(response.headers))
         return StreamingResponse(
@@ -502,7 +503,8 @@ async def proxy_openai(path: str, request: Request) -> Response:
         )
 
     log_upstream(request, upstream, url, started, response.status_code,
-                 extract_usage(response.content)[0] or {}, False, response_headers=response.headers)
+                 extract_usage(response.content)[0] or {}, False, response_headers=response.headers,
+                 response_content=response.content)
     content = response.content
     if response.is_success and path == "chat/completions":
         content = normalize_bedrock_tool_names(content, request_payload, base_url)
@@ -794,11 +796,34 @@ def upstream_url(base_url: str, path: str) -> str:
     return f"{base}{prefix}/{path}"
 
 
+def upstream_error_body(content, request, route):
+    """Keep provider diagnostics bounded and omit known authentication secrets."""
+    body = content.decode("utf-8", errors="replace")
+    try:
+        value = json.loads(body)
+    except (ValueError, TypeError):
+        value = None
+    if isinstance(value, dict):
+        detail = value.get("error", value)
+        if isinstance(detail, dict):
+            detail = {key: detail[key] for key in ("message", "type", "code", "param")
+                      if key in detail}
+        body = json.dumps(detail, ensure_ascii=False)
+    credentials = [upstream_api_key(route), request.headers.get("x-api-key", "")]
+    authorization = request.headers.get("authorization", "")
+    if authorization:
+        credentials.extend((authorization, authorization.split(" ", 1)[-1]))
+    for credential in sorted(filter(None, credentials), key=len, reverse=True):
+        body = body.replace(credential, "[REDACTED]")
+    body = re.sub(r"(?i)\bBearer\s+[^\s\"<>]+", "Bearer [REDACTED]", body)
+    return body[:4096], len(body) > 4096
+
+
 def log_upstream(request, route, url, started, status, usage, streaming,
-                 *, response_headers=None, error=None):
+                 *, response_headers=None, error=None, response_content=None):
     payload = parse_json_body(getattr(request, "_body", b"")) or {}
     sandbox = request_gateway(request)
-    # Deliberately exclude bodies, headers, credentials and query strings.
+    # Success bodies, request bodies, headers and query strings stay excluded.
     from urllib.parse import urlsplit
     endpoint = urlsplit(url)
     record = {
@@ -813,9 +838,13 @@ def log_upstream(request, route, url, started, status, usage, streaming,
         "total_tokens": usage.get("total_tokens"),
         "request_id": ((response_headers.get("x-request-id") or response_headers.get("x-amzn-requestid"))
                        if response_headers is not None else None),
-        "error": error,
+        "error": error or ("upstream_http_error" if status is not None and status >= 400 else None),
     }
-    logger.info("%s", json.dumps(record))
+    if status is not None and status >= 400 and response_content is not None:
+        record["error_body"], record["error_body_truncated"] = upstream_error_body(
+            response_content, request, route)
+    log = logger.error if error or (status is not None and status >= 400) else logger.info
+    log("%s", json.dumps(record))
 
 
 async def stream_upstream(response, request, route, url, started, key_hash) -> AsyncIterator[bytes]:

@@ -106,6 +106,31 @@ class UpstreamTests(unittest.TestCase):
         self.assertNotIn("private",json.dumps(record))
         self.assertNotIn("client-secret",json.dumps(record))
 
+    def test_explicit_stream_false_reaches_upstream_including_model_alias(self):
+        from dataclasses import replace
+        self.key = replace(self.key, base_url="https://bedrock-mantle.ap-south-1.api.aws/v1")
+        for model in ["deepseek.v3.1", "deepseek.v3-v1:0"]:
+            with self.subTest(model=model):
+                expected = {"model": "deepseek.v3.1", "stream": False,
+                            "messages": [{"role": "user", "content": "test"}]}
+                def handler(req):
+                    self.assertEqual(json.loads(req.content), expected)
+                    self.assertNotIn("stream_options", json.loads(req.content))
+                    return httpx.Response(200, json={"choices": [{
+                        "finish_reason": "tool_calls", "message": {"role": "assistant", "tool_calls": [{
+                            "id": "complete", "type": "function", "function": {
+                                "name": "run_command", "arguments": '{"command":"echo ok"}'}}]}}]})
+                self.upstream(handler)
+                with self.assertLogs("uvicorn.error", level="INFO") as logs:
+                    response = self.client.post("/v1/chat/completions",
+                        headers={**self.headers, "Accept": "application/json"},
+                        json={**expected, "model": model})
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("application/json", response.headers["content-type"])
+                self.assertEqual(response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+                                 '{"command":"echo ok"}')
+                self.assertFalse(json.loads(logs.records[-1].getMessage())["stream"])
+
     def test_stream_error_retains_real_status(self):
         self.upstream(lambda _:httpx.Response(404,json={"error":"missing"}))
         with self.assertLogs("uvicorn.error",level="INFO") as logs:
@@ -114,6 +139,39 @@ class UpstreamTests(unittest.TestCase):
         record=json.loads(logs.records[-1].getMessage())
         self.assertEqual(record["status"],404)
         self.assertIsNone(record["total_tokens"])
+        self.assertEqual(record["error_body"], '"missing"')
+        self.assertEqual(logs.records[-1].levelname, "ERROR")
+
+    def test_provider_errors_include_diagnostics_without_credentials_or_request(self):
+        body = {"error": {"message": "Model failed private-upstream-secret client-secret",
+                          "type": "server_error", "code": "internal_error",
+                          "api_key": "other-secret"}, "messages": ["private prompt"]}
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                self.upstream(lambda _: httpx.Response(500, json=body,
+                    headers={"x-amzn-requestid": "bedrock-request-1"}))
+                with self.assertLogs("uvicorn.error", level="ERROR") as logs:
+                    response = self.client.post("/v1/chat/completions", headers=self.headers,
+                        json={"model": "test", "stream": streaming,
+                              "messages": [{"role": "user", "content": "private prompt"}]})
+                self.assertEqual(response.json(), body)
+                record = json.loads(logs.records[-1].getMessage())
+                self.assertEqual(record["request_id"], "bedrock-request-1")
+                self.assertEqual(record["error"], "upstream_http_error")
+                self.assertIn("internal_error", record["error_body"])
+                self.assertFalse(record["error_body_truncated"])
+                for secret in ("private-upstream-secret", "client-secret", "other-secret", "private prompt"):
+                    self.assertNotIn(secret, json.dumps(record))
+
+    def test_plaintext_error_is_bounded_and_bearer_token_redacted(self):
+        self.upstream(lambda _: httpx.Response(502, text="Bearer unknown-secret " + "x" * 5000))
+        with self.assertLogs("uvicorn.error", level="ERROR") as logs:
+            response = self.client.post("/v1/chat/completions", headers=self.headers, json={"model": "test"})
+        record = json.loads(logs.records[-1].getMessage())
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(len(record["error_body"]), 4096)
+        self.assertTrue(record["error_body_truncated"])
+        self.assertNotIn("unknown-secret", record["error_body"])
 
     def test_stream_usage_across_chunk_boundaries(self):
         class Chunks(httpx.AsyncByteStream):

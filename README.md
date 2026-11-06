@@ -354,7 +354,12 @@ Each forwarded request emits an `llm_upstream_response` JSON record in the
 container logs: gateway ID, route/provider, upstream host/path, model, actual
 upstream HTTP status, total `duration_ms`, streaming flag, input/output/total
 token counts, provider request ID, and transport error class if applicable.
-Request/response bodies, API keys, and authorization headers are excluded.
+Upstream HTTP failures and transport failures log at ERROR level. HTTP failures
+include `error_body` (up to 4096 characters) and `error_body_truncated`.
+JSON errors include the provider's message, type, code, and parameter; non-JSON
+errors include bounded response text. Known authentication credentials and bearer
+tokens are redacted. Request bodies, successful response bodies, API keys, and
+authorization headers are excluded.
 Token counts are `null` when the provider does not return usage, including most
 error responses. Streaming Chat Completions request `stream_options.include_usage`
 and collect usage from SSE events while forwarding chunks without buffering the
