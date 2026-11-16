@@ -86,6 +86,7 @@ def require_gateway_key(request: Request) -> GatewayKey:
     env_hashes = {item.strip() for item in os.getenv("GATEWAY_KEY_HASHES", "").split(",") if item.strip()}
     stored_key = request.app.state.key_store.get_key(key_hash)
     if stored_key:
+        request.state.billing_key = stored_key
         return stored_key
     if key_hash in env_hashes:
         return GatewayKey(
@@ -190,6 +191,17 @@ def require_admin_token(token: str | None) -> None:
         raise HTTPException(status_code=404, detail="Admin gateway management is disabled")
     if token != expected:
         raise HTTPException(status_code=401, detail="Invalid admin token")
+
+
+@app.get("/admin/billing/usage")
+async def billing_usage(request: Request, after_id: int = 0, limit: int = 500, x_admin_token: str | None = Header(default=None)) -> JSONResponse:
+    require_admin_token(x_admin_token)
+    exporter = getattr(request.app.state.usage_store, "billing_usage", None)
+    if exporter is None:
+        raise HTTPException(status_code=503, detail="Persistent gateway usage storage is required for billing")
+    if after_id < 0 or limit < 1 or limit > 500:
+        raise HTTPException(status_code=400, detail="Invalid billing cursor or limit")
+    return JSONResponse({"items": exporter(after_id, limit)})
 
 
 @app.post("/admin/gateways")
@@ -685,6 +697,7 @@ def track_usage(
         return
 
     request_id = response_headers.get("x-request-id")
+    billing_key = getattr(request.state, "billing_key", None)
     request.app.state.usage_store.record_usage(
         key_hash=key_hash,
         method=request.method,
@@ -695,6 +708,8 @@ def track_usage(
         output_tokens=usage.get("output_tokens", usage.get("completion_tokens")),
         total_tokens=usage.get("total_tokens"),
         request_id=request_id,
+        gateway_id=billing_key.gateway_id if billing_key else None,
+        key_name=billing_key.name if billing_key else None,
     )
 
 

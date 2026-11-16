@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import timezone
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,6 +95,8 @@ class UsageStore(Protocol):
         output_tokens: int | None,
         total_tokens: int | None,
         request_id: str | None,
+        gateway_id: str | None = None,
+        key_name: str | None = None,
     ) -> None:
         ...
 
@@ -364,6 +367,10 @@ class SQLiteUsageStore:
     def initialize(self) -> None:
         with self.connect() as conn:
             conn.execute(SQLITE_CREATE_USAGE_TABLE_SQL)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(token_usage)")}
+            for column in ("gateway_id", "key_name"):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE token_usage ADD COLUMN {column} TEXT")
 
     def record_usage(
         self,
@@ -377,15 +384,17 @@ class SQLiteUsageStore:
         output_tokens: int | None,
         total_tokens: int | None,
         request_id: str | None,
+        gateway_id: str | None = None,
+        key_name: str | None = None,
     ) -> None:
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO token_usage (
                     key_hash, method, path, model, status_code,
-                    input_tokens, output_tokens, total_tokens, request_id
+                    input_tokens, output_tokens, total_tokens, request_id, gateway_id, key_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     key_hash,
@@ -397,8 +406,15 @@ class SQLiteUsageStore:
                     output_tokens,
                     total_tokens,
                     request_id,
+                    gateway_id,
+                    key_name,
                 ),
             )
+
+    def billing_usage(self, after_id: int, limit: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT id, gateway_id, key_name, model, input_tokens, output_tokens, total_tokens, created_at FROM token_usage WHERE id > ? ORDER BY id LIMIT ?", (after_id, limit)).fetchall()
+        return [dict(zip(("id","gateway_id","key_name","model","input_tokens","output_tokens","total_tokens","created_at"), row)) for row in rows]
 
     def total_tokens_for_key(self, key_hash: str) -> int:
         with self.connect() as conn:
@@ -655,6 +671,8 @@ class PostgresUsageStore:
     def initialize(self) -> None:
         with psycopg.connect(self.dsn) as conn:
             conn.execute(CREATE_USAGE_TABLE_SQL)
+            conn.execute("ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS gateway_id TEXT")
+            conn.execute("ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS key_name TEXT")
 
     def record_usage(
         self,
@@ -668,15 +686,17 @@ class PostgresUsageStore:
         output_tokens: int | None,
         total_tokens: int | None,
         request_id: str | None,
+        gateway_id: str | None = None,
+        key_name: str | None = None,
     ) -> None:
         with psycopg.connect(self.dsn) as conn:
             conn.execute(
                 """
                 INSERT INTO token_usage (
                     key_hash, method, path, model, status_code,
-                    input_tokens, output_tokens, total_tokens, request_id
+                    input_tokens, output_tokens, total_tokens, request_id, gateway_id, key_name
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     key_hash,
@@ -688,8 +708,15 @@ class PostgresUsageStore:
                     output_tokens,
                     total_tokens,
                     request_id,
+                    gateway_id,
+                    key_name,
                 ),
             )
+
+    def billing_usage(self, after_id: int, limit: int) -> list[dict[str, Any]]:
+        with psycopg.connect(self.dsn) as conn:
+            rows = conn.execute("SELECT id, gateway_id, key_name, model, input_tokens, output_tokens, total_tokens, created_at FROM token_usage WHERE id > %s ORDER BY id LIMIT %s", (after_id, limit)).fetchall()
+        return [dict(zip(("id","gateway_id","key_name","model","input_tokens","output_tokens","total_tokens","created_at"), (*row[:7], (row[7].replace(tzinfo=timezone.utc) if row[7].tzinfo is None else row[7]).isoformat()))) for row in rows]
 
     def total_tokens_for_key(self, key_hash: str) -> int:
         with psycopg.connect(self.dsn) as conn:
@@ -716,6 +743,8 @@ class NullUsageStore:
         output_tokens: int | None,
         total_tokens: int | None,
         request_id: str | None,
+        gateway_id: str | None = None,
+        key_name: str | None = None,
     ) -> None:
         return None
 
