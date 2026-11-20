@@ -382,3 +382,23 @@ It leaves tool arguments and IDs intact, logs `llm_tool_name_normalized`, and
 retains usage/status telemetry. Other providers, models, unknown tools and
 unrecognized suffixes are forwarded unchanged. Mate's tool approval checks still
 run against the advertised tool name. Streaming responses are unchanged.
+
+
+## Search crawlers
+
+The gateway is an API origin, not a public website. It serves an unauthenticated
+`GET /robots.txt` (and HEAD) with `User-agent: *` and `Disallow: /`. HTTP responses,
+including authentication errors and streamed model responses, include
+`X-Robots-Tag: noindex, nofollow, nosnippet`. The ASGI middleware adds headers
+without buffering SSE responses; API credentials are still required as before.
+No DNS changes are needed. Build and deploy the gateway image for these controls
+to reach the public origin.
+
+robots.txt discourages compliant crawlers; it does not enforce access control or
+remove an already indexed URL. A robots-blocked URL cannot be recrawled to read
+its noindex header. For existing search listings, use Search Console's Removals
+tool for immediate temporary hiding, and check the unauthenticated URL's 401
+response in URL Inspection for permanent exclusion. Do not expose authenticated
+API content just to let a search crawler inspect it.
+
+Reference: https://developers.google.com/search/docs/crawling-indexing/block-indexing

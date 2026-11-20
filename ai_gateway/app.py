@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
+from .crawler_policy import CrawlerPolicyMiddleware
 from .guardrails import evaluate_guardrails, load_guardrails
 from .config import Gateway, Route
 from .keys import create_and_store_key, hash_key, provider_base_url, upsert_routing_config
@@ -74,6 +75,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="AI Gateway", lifespan=lifespan)
+app.add_middleware(CrawlerPolicyMiddleware)
 
 
 def require_gateway_key(request: Request) -> GatewayKey:
